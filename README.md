@@ -105,9 +105,11 @@ result in one line.
    `gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user` (add
    `--agent claude-code` or `--agent codex` when you are that agent).
    Otherwise clone `https://github.com/kstulgys/ubw-timesheet` into a
-   temporary directory (without git, download and extract
-   `https://github.com/kstulgys/ubw-timesheet/archive/refs/heads/main.zip`)
-   and copy its `ubw-timesheet` folder to `<skills directory>/ubw-timesheet`.
+   temporary directory, or without git download and extract
+   `https://github.com/kstulgys/ubw-timesheet/archive/refs/heads/main.zip`
+   (it extracts to a folder named `ubw-timesheet-main`). The skill is the
+   inner `ubw-timesheet` folder, the one that contains `SKILL.md`; copy that
+   folder, not the repository root, to `<skills directory>/ubw-timesheet`.
    Done when `<skills directory>/ubw-timesheet/SKILL.md` and
    `<skills directory>/ubw-timesheet/scripts/ubw.mjs` exist.
 3. **Check Node.js.** Run `node --version`. Done when it prints version 18 or
