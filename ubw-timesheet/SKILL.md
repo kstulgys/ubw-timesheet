@@ -73,8 +73,8 @@ steps 1 and 2 for today and report the period.
 - Exit code 2: the session is gone and silent renewal failed. Run `login`
   yourself; the user signs in once (with MFA) in the window that opens.
 - "not editable": the row is Closed or Transferred. Report it; do not retry.
-- No browser found: set `UBW_BROWSER` to a Chrome, Edge, or Brave executable,
-  or run `login --cookie "<Cookie header of a logged-in request>"`.
+- No browser found: ask the user to install Chrome or Edge, or set
+  `UBW_BROWSER` to a Chromium-based browser executable.
 - Parse errors or wrong values: Unit4 changed the screen. `PROTOCOL.md`
   documents the requests and markup the script relies on and how the traffic
   was captured, so you can fix `scripts/ubw.mjs`.

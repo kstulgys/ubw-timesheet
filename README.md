@@ -21,30 +21,25 @@ once for the sign-in and keeps the session alive after that.
 
 ## Install
 
-With GitHub CLI 2.90 or newer, one command installs the skill where your
-agent looks for it. Without `--agent` it installs for GitHub Copilot.
+Paste this into your agent (GitHub Copilot, Claude Code, Codex, or another
+agent that runs commands for you):
 
-```sh
-gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user
-gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user --agent claude-code
-gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user --agent codex
-```
+> Install the agent skill from https://github.com/kstulgys/ubw-timesheet by
+> following the "Instructions for agents" section of its README, then show me
+> my Unit4 timesheet for this week.
 
-Without GitHub CLI, clone the repository and put its `ubw-timesheet` folder
-(or a symlink to it) in the directory your agent scans: `~/.copilot/skills`
-or `~/.agents/skills` for Copilot, `~/.claude/skills` for Claude Code,
-`~/.agents/skills` for Codex and omp. For a project-scoped install, use the
-same folder names under the repository root (`.github/skills` also works for
-Copilot).
+The agent downloads the skill into its skills folder, checks that Node.js is
+present, and starts the sign-in below the first time you ask for the
+timesheet. From then on, ask for your hours in plain words.
 
 ## First use
 
-Ask your agent for your timesheet. When no session is stored, or when Unit4
-wants a new sign-in, the agent says so and a browser window opens on the
-Unit4 sign-in page. Sign in with your Microsoft account, including the MFA
-prompt. The window closes by itself when the timesheet loads, and the agent
-continues with your request. Later requests renew the session silently, with
-no MFA prompt, until Unit4 asks for Microsoft again.
+When no session is stored, or when Unit4 wants a new sign-in, the agent says
+so and a browser window opens on the Unit4 sign-in page. Sign in with your
+Microsoft account, including the MFA prompt. The window closes by itself when
+the timesheet loads, and the agent continues with your request. Later
+requests renew the session silently, with no MFA prompt, until Unit4 asks for
+Microsoft again.
 
 ## What to ask
 
@@ -95,6 +90,34 @@ follows and the commands of `ubw-timesheet/scripts/ubw.mjs`.
 requests, field names, and markup the script depends on, and how to record
 new traffic when Unit4 changes the screen. `node test/smoke.mjs` runs the
 platform checks on any machine with a Chromium browser.
+
+## Instructions for agents
+
+You were asked to install this skill. Do the steps in order and report each
+result in one line.
+
+1. **Pick the skills directory** of the agent you are, under the user's home
+   directory (`~`; on Windows `%USERPROFILE%`): GitHub Copilot
+   `~/.copilot/skills`, Claude Code `~/.claude/skills`, every other agent
+   (Codex, omp, ...) `~/.agents/skills`. Create it when it is missing. Done
+   when the directory exists.
+2. **Download the skill.** With GitHub CLI 2.90 or newer installed, run
+   `gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user` (add
+   `--agent claude-code` or `--agent codex` when you are that agent).
+   Otherwise clone `https://github.com/kstulgys/ubw-timesheet` into a
+   temporary directory (without git, download and extract
+   `https://github.com/kstulgys/ubw-timesheet/archive/refs/heads/main.zip`)
+   and copy its `ubw-timesheet` folder to `<skills directory>/ubw-timesheet`.
+   Done when `<skills directory>/ubw-timesheet/SKILL.md` and
+   `<skills directory>/ubw-timesheet/scripts/ubw.mjs` exist.
+3. **Check Node.js.** Run `node --version`. Done when it prints version 18 or
+   newer. When `node` is missing or older, install the current LTS release
+   (Windows: `winget install OpenJS.NodeJS.LTS`; macOS: `brew install node`;
+   Linux: the distribution package or https://nodejs.org) and run
+   `node --version` again in a new shell.
+4. **Use the skill now.** Read `<skills directory>/ubw-timesheet/SKILL.md`
+   and follow it for the rest of the user's request. Later sessions load the
+   skill on their own.
 
 ## License
 
