@@ -7,9 +7,12 @@ description: Read, fill, and submit Unit4 ERP (UBW, Agresso) timesheets through 
 
 The Unit4 web UI is slow to click through. `scripts/ubw.mjs` sends the same
 requests the UI sends and prints the result. Node 18 or newer, no packages.
+The user talks to you in plain language and never runs a command; you run
+every command, including the sign-in.
 
 Run every command as `node <this skill dir>/scripts/ubw.mjs <command>`; add
-`--json` when you need to parse the output.
+`--json` when you need to parse the output. Invoked without a request, do
+steps 1 and 2 for today and report the period.
 
 ## Vocabulary
 
@@ -24,9 +27,12 @@ Run every command as `node <this skill dir>/scripts/ubw.mjs <command>`; add
 ## Steps
 
 1. **Check the session.** Run `whoami`. The tool renews an idle session by
-   itself, without prompting anyone. Exit code 2 means renewal failed: run
-   `login`, tell the user a browser window opened and that Microsoft may ask
-   for MFA, and wait until the command prints their `userId`.
+   itself, without prompting anyone. Exit code 2 means the user has to sign
+   in once: tell the user that a browser window opens now for the Unit4
+   sign-in and that Microsoft may ask for MFA, then run `login` yourself with
+   a timeout of at least five minutes (when your shell cannot wait that long,
+   start `login` in the background and poll `whoami` until it exits 0). Done
+   when `whoami` prints the user's `userId`.
 2. **Read the period.** Run `show <YYYY-MM-DD>` for a date in the target
    period (`show today` for the current one). Done when you have the period's
    dates, its status, and every row with its hours.
@@ -52,7 +58,7 @@ Run every command as `node <this skill dir>/scripts/ubw.mjs <command>`; add
 
 | Command | Effect |
 | --- | --- |
-| `login` | Renews silently when it can; otherwise opens a browser for SSO. `--url` and `--menu` override the tenant defaults; `--fresh` forces the window. |
+| `login` | Renews silently when it can; otherwise opens a browser window and waits until the user has signed in. `--url` and `--menu` override the tenant defaults when the user names another tenant; `--fresh` forces the window. |
 | `whoami` | Prints user, client, and minutes left in the session. |
 | `show [DATE]` | Period, days, rows, totals. Default `today`. |
 | `search WORDS` | Fresh server lookup of work orders; keeps rows whose code or description contain every word. Server returns at most 50 matches for the longest word. |
@@ -63,8 +69,8 @@ Run every command as `node <this skill dir>/scripts/ubw.mjs <command>`; add
 
 ## When something fails
 
-- Exit code 2: the session is gone and silent renewal failed. Run `login`;
-  the user signs in once (with MFA) in the window that opens.
+- Exit code 2: the session is gone and silent renewal failed. Run `login`
+  yourself; the user signs in once (with MFA) in the window that opens.
 - "not editable": the row is Closed or Transferred. Report it; do not retry.
 - No browser found: set `UBW_BROWSER` to a Chrome, Edge, or Brave executable,
   or run `login --cookie "<Cookie header of a logged-in request>"`.

@@ -30,7 +30,7 @@ class UbwError extends Error {
   }
 }
 class NeedsLogin extends UbwError {
-  constructor(message = "Session expired or missing. Run: ubw login") {
+  constructor(message = "No valid Unit4 session. Run the login command; it opens a browser window for a one-time sign-in.") {
     super(message, { exitCode: 2 });
   }
 }
@@ -838,7 +838,7 @@ async function ensureLoggedIn(config, { interactive, log }) {
   if (session && (await session.renew().catch(() => false))) return persist(session, await session.info());
   if (!interactive) throw new NeedsLogin();
   session = await browserLogin(config, { timeoutMs: 5 * 60 * 1000, log });
-  if (!session) throw new NeedsLogin("Login did not complete. Run: ubw login");
+  if (!session) throw new NeedsLogin("Sign-in did not finish within 5 minutes. Run the login command again.");
   return persist(session, await session.info());
 }
 
@@ -1101,7 +1101,12 @@ const commands = {
   ubw logout                                forget session and browser profile
 
 DATE is YYYY-MM-DD, today or yesterday. Add --json for machine output.
-Exit codes: 0 ok, 1 error, 2 login needed.`);
+Exit codes: 0 ok, 1 error, 2 login needed.
+
+Environment:
+  UBW_HOME     data directory (default ~/.ubw-timesheet)
+  UBW_BROWSER  browser executable when none is found (Chrome, Edge, or Brave)
+  UBW_DEBUG    directory; every page received is written there`);
   },
 };
 
