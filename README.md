@@ -3,15 +3,16 @@
 Unit4 ERP (UBW, the product once sold as Agresso) keeps employee hours in a
 web timesheet that takes many clicks per week. This repository is an
 [agent skill](https://agentskills.io) for coding agents that load `SKILL.md`
-files (Claude Code, Codex, omp, and others). With it installed, you tell your
-agent which hours go where, and the agent books them by sending the same form
-posts the browser sends. You never run a command yourself: the agent opens a
-browser window once for the sign-in and keeps the session alive after that.
+files: GitHub Copilot (CLI, VS Code, and JetBrains agent mode), Claude Code,
+Codex, omp, and others. With it installed, you tell your agent which hours go
+where, and the agent books them by sending the same form posts the browser
+sends. You never run a command yourself: the agent opens a browser window
+once for the sign-in and keeps the session alive after that.
 
 ## Requirements
 
-- Node.js 18 or newer on the machine that runs the agent. The script has no
-  npm dependencies.
+- Windows, macOS, or Linux with Node.js 18 or newer on the machine that runs
+  the agent. The script has no npm dependencies.
 - Chrome, Edge, or Brave, used once for the sign-in.
 - A Unit4 account on a tenant with the "Timesheets - standard" screen. The
   defaults point at Macaw's tenant. On another tenant, tell the agent the
@@ -20,16 +21,21 @@ browser window once for the sign-in and keeps the session alive after that.
 
 ## Install
 
-Clone the repository into the directory your agent scans for skills.
-`~/.agents/skills` is the cross-agent location (Codex, omp, and others read
-it). Claude Code reads `~/.claude/skills`; clone there too, or add a symlink.
+With GitHub CLI 2.90 or newer, one command installs the skill where your
+agent looks for it. Without `--agent` it installs for GitHub Copilot.
 
 ```sh
-git clone https://github.com/kstulgys/ubw-timesheet ~/.agents/skills/ubw-timesheet
-ln -s ~/.agents/skills/ubw-timesheet ~/.claude/skills/ubw-timesheet   # Claude Code
+gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user
+gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user --agent claude-code
+gh skill install kstulgys/ubw-timesheet ubw-timesheet --scope user --agent codex
 ```
 
-For a project-scoped install, clone into `<repo>/.agents/skills/ubw-timesheet`.
+Without GitHub CLI, clone the repository and put its `ubw-timesheet` folder
+(or a symlink to it) in the directory your agent scans: `~/.copilot/skills`
+or `~/.agents/skills` for Copilot, `~/.claude/skills` for Claude Code,
+`~/.agents/skills` for Codex and omp. For a project-scoped install, use the
+same folder names under the repository root (`.github/skills` also works for
+Copilot).
 
 ## First use
 
@@ -73,15 +79,22 @@ Tested in September 2026 on Linux with Chrome 152 against Macaw's tenant:
 sign-in, session renewal, reading periods, work-order search, booking hours on
 new and existing rows, removing a row, and the guards on transferred periods.
 Sending a period for approval replays the request sequence recorded from the
-web UI and has not run from the script yet. Browser discovery for Windows and
-macOS is in the script, but nobody has run it yet.
+web UI and has not run from the script yet.
+
+A smoke test runs in GitHub Actions on Windows, macOS, and Linux with Node 18
+and 22. It covers what differs per operating system: browser discovery, the
+pipe the script uses to talk to the browser, reading cookies from it, and
+starting the script through a symlink or junction. The sign-in window itself
+has been used on Linux only.
 
 ## For maintainers
 
-[`SKILL.md`](SKILL.md) holds the steps the agent follows and the commands of
-`scripts/ubw.mjs`. [`PROTOCOL.md`](PROTOCOL.md) documents the requests, field
-names, and markup the script depends on, and how to record new traffic when
-Unit4 changes the screen.
+[`ubw-timesheet/SKILL.md`](ubw-timesheet/SKILL.md) holds the steps the agent
+follows and the commands of `ubw-timesheet/scripts/ubw.mjs`.
+[`ubw-timesheet/PROTOCOL.md`](ubw-timesheet/PROTOCOL.md) documents the
+requests, field names, and markup the script depends on, and how to record
+new traffic when Unit4 changes the screen. `node test/smoke.mjs` runs the
+platform checks on any machine with a Chromium browser.
 
 ## License
 

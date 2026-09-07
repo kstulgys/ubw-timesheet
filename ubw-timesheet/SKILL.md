@@ -1,6 +1,7 @@
 ---
 name: ubw-timesheet
 description: Read, fill, and submit Unit4 ERP (UBW, Agresso) timesheets through a CLI that talks to the timesheet screen directly. Use when the user wants to log hours on work orders, see a week's timesheet, submit a week for approval, or log in to Unit4 for the first time.
+license: MIT
 ---
 
 # Unit4 timesheets
