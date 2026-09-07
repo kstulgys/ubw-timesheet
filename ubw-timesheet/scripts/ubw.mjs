@@ -11,7 +11,7 @@ import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const HOME_DIR = process.env.UBW_HOME || path.join(os.homedir(), ".ubw-timesheet");
 const CONFIG_FILE = path.join(HOME_DIR, "config.json");
@@ -1129,6 +1129,15 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+// Node resolves the entry file through symlinks, so compare real paths (a
+// symlinked skill directory is the normal install).
+function isEntryPoint() {
+  try {
+    return process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+if (isEntryPoint()) main();
 
-export { Screen, Session, BrowserCdp, browserLogin, parseInputs, tags, elementAt, childElements };
+export { Screen, Session, BrowserCdp, browserLogin, findBrowser, parseInputs, tags, elementAt, childElements };
