@@ -21,12 +21,13 @@ once for the sign-in and keeps the session alive after that.
 
 ## Install
 
-Paste this into your agent (GitHub Copilot, Claude Code, Codex, or another
-agent that runs commands for you):
+Copy this prompt (the button in the top right corner of the box) and paste it
+into your agent (GitHub Copilot, Claude Code, Codex, or another agent that
+runs commands for you):
 
-> Install the agent skill from https://github.com/kstulgys/ubw-timesheet by
-> following the "Instructions for agents" section of its README, then show me
-> my Unit4 timesheet for this week.
+```text
+Install the agent skill from https://github.com/kstulgys/ubw-timesheet by following the "Instructions for agents" section of its README, then show me my Unit4 timesheet for this week.
+```
 
 The agent downloads the skill into its skills folder, checks that Node.js is
 present, and starts the sign-in below the first time you ask for the
