@@ -1,0 +1,3 @@
+interface:
+  display_name: "Unit4 Timesheet"
+  short_description: "Fill and submit Unit4 ERP timesheets"

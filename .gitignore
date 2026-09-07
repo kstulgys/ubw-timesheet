@@ -1,0 +1,7 @@
+# Pages dumped by UBW_DEBUG and any captured traffic
+*.html
+*.har
+# Local session state if someone points UBW_HOME here
+.ubw-timesheet/
+node_modules/
+.DS_Store
