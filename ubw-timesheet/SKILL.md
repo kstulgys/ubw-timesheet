@@ -24,6 +24,8 @@ steps 1 and 2 for today and report the period.
   timesheet row is one work order plus a time code (`0` = normal hours).
 - **Status**: `Draft` (editable), `Ready` (sent for approval; rows show
   `Ready` or `Closed`), `Transferred` (processed). Change Draft rows only.
+  The period carries a status of its own, above the rows: approval needs the
+  period status at `Ready` as well, and `show` prints it on the first line.
 
 ## Steps
 
@@ -51,9 +53,12 @@ steps 1 and 2 for today and report the period.
    prints the saved row. Done when every requested day shows the requested
    hours and the printed total for the period matches what the user expects.
 5. **Submit only on request.** `submit <date>` marks every row of the period
-   Ready and sends it for approval. Do this only when the user asks for it,
-   the period has ended, and the user has confirmed the totals from `show`.
-   Done when the output says "sent for approval".
+   Ready, sets the period status to Ready, and sends it for approval. Do this
+   only when the user asks for it, the period has ended, and the user has
+   confirmed the totals from `show`. Done when the first line of the output
+   reads `status Ready (N)` and the message names the whole timesheet: "Parts
+   of the timesheet ... have been sent for approval" means the rows moved and
+   the period did not, which leaves the week with the employee.
 
 ## Commands
 
@@ -65,7 +70,7 @@ steps 1 and 2 for today and report the period.
 | `search WORDS` | Fresh server lookup of work orders; keeps rows whose code or description contain every word. Server returns at most 50 matches for the longest word. |
 | `set WO DATE=H [DATE=H ...]` | Writes hours on the work order's row and saves as Draft. `--timecode` for non-normal hours. Dates may span periods. |
 | `delete WO DATE` | Removes the work order's row from DATE's period and saves. |
-| `submit [DATE] [--draft]` | Ready + save (sends for approval). `--draft` sets rows back to Draft. |
+| `submit [DATE] [--draft]` | Rows Ready + period Ready + save (sends for approval). `--draft` takes the period back to Draft, and reports the rows it cannot pull back. |
 | `logout` | Forgets the stored session and browser profile. |
 
 ## When something fails

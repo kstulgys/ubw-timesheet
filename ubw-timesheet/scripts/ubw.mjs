@@ -482,6 +482,7 @@ class Screen {
     const headerList = (title) => Object.keys(this.lists).find((n) => n.startsWith(headerPrefix) && this.lists[n].title === title);
     const periodName = headerList("Period");
     const statusName = headerList("Status");
+    this.names.status = statusName || null;
     this.period = periodName ? this.fields[periodName + "$Editor"] : "";
     this.periodDescription = periodName ? this.fields[periodName + "$RowDescription"] : "";
     this.status = statusName ? { code: this.fields[statusName + "$RowValue"], label: this.fields[statusName + "$RowDescription"] } : {};
@@ -602,6 +603,20 @@ class Screen {
 
   dayColumn(date) {
     return this.days.find((d) => d.date && isoDate(d.date) === isoDate(date)) || null;
+  }
+
+  // Header status field: "P" Draft, "N" Ready. The label comes from the lookup,
+  // because the screen speaks the user's language. A save has to follow.
+  async setHeaderStatus(code) {
+    if (!this.names.status) throw new UbwError("Status field not found on the timesheet screen.");
+    const { items } = await this.lookup(this.names.status, "");
+    const option = items.find((i) => i.value === code);
+    if (!option) throw new UbwError(`Status ${code} is not offered for period ${this.period} (offered: ${items.map((i) => i.value).join(", ") || "none"}).`);
+    return this.postback(this.names.status + "$Control", "validate", {
+      [this.names.status + "$Editor"]: option.description,
+      [this.names.status + "$RowValue"]: option.value,
+      [this.names.status + "$RowDescription"]: option.description,
+    });
   }
 
   // One WebForms postback. `changes` are field values to set (marks their IsDirty flags).
@@ -1074,16 +1089,44 @@ const commands = {
 
   async submit({ flags, positional }) {
     const date = parseIsoDate(positional[0] || "today");
+    const wanted = flags.draft ? "P" : "N";
+    const rowWanted = flags.draft ? "Draft" : "Ready";
     await withSession(flags, async (session) => {
       let screen = await Screen.open(session, date);
       if (!screen.rows.length) throw new UbwError(`Period ${screen.period} has no rows to submit.`);
+      if (screen.status.code === wanted && screen.rows.every((r) => r.status === rowWanted)) {
+        if (flags.json) out.json(screen.toJSON());
+        else {
+          printScreen(screen, flags);
+          console.log(`Period ${screen.period}: already ${flags.draft ? "Draft" : "sent for approval"}, nothing saved`);
+        }
+        return;
+      }
       if (!screen.buttons.ready) throw new UbwError(`Period ${screen.period} is ${screen.status.label}; status cannot change.`);
-      const marks = Object.fromEntries(screen.rows.map((r) => [r.name + "$_delete", "on"]));
-      screen = await screen.postback(flags.draft ? screen.buttons.draft : screen.buttons.ready, flags.draft ? "action:SetDraftStatus" : "action:SetSubmitStatus", marks);
+      // Two things carry a status: every grid row, and the timesheet header. The
+      // grid buttons move the rows only; a period whose rows are Ready under a
+      // Draft header reports "Parts of the timesheet ... have been sent for
+      // approval" and still waits for the employee. The header field moves the
+      // period as a whole, so the header goes first on the way back to Draft and
+      // last on the way to Ready.
+      const mark = () => Object.fromEntries(screen.rows.map((r) => [r.name + "$_delete", "on"]));
+      if (flags.draft && screen.status.code !== wanted) screen = await screen.setHeaderStatus(wanted);
+      screen = await screen.postback(flags.draft ? screen.buttons.draft : screen.buttons.ready, flags.draft ? "action:SetDraftStatus" : "action:SetSubmitStatus", mark());
+      if (screen.status.code !== wanted) screen = await screen.setHeaderStatus(wanted);
       screen = await screen.postback(screen.buttons.save);
       if (flags.json) out.json(screen.toJSON());
       else printScreen(screen, flags);
-      if (screen.messages.errors.length || screen.messages.result?.type !== "success") throw new UbwError("Submit did not confirm success.", { details: screen.messages });
+      if (screen.messages.errors.length) throw new UbwError("Save reported errors.", { details: screen.messages });
+      if (screen.status.code !== wanted) throw new UbwError(`Period ${screen.period} still has status ${screen.status.label} (${screen.status.code}).`, { details: screen.messages });
+      // Rows that the approver already holds do not come back on the employee's request.
+      const stuck = screen.rows.filter((r) => r.status !== rowWanted);
+      if (stuck.length)
+        throw new UbwError(
+          `Period ${screen.period} header is ${screen.status.label}, but ${stuck.map((r) => `${r.workOrder} (${r.status})`).join(", ")} did not change to ${rowWanted}.` +
+            (flags.draft ? " Unit4 keeps rows that are already sent for approval; the approver has to reject them." : ""),
+          { details: screen.messages },
+        );
+      if (screen.messages.result?.type !== "success") throw new UbwError("Submit did not confirm success.", { details: screen.messages });
     });
   },
 
@@ -1097,7 +1140,7 @@ const commands = {
   ubw search TEXT                           find work orders by code or description
   ubw set WO DATE=HOURS [DATE=HOURS ...]    write hours on the row for work order WO (adds the row when missing), saves as draft
   ubw delete WO DATE                        remove the WO row from the period containing DATE
-  ubw submit [DATE] [--draft]               mark every row Ready and save (sends the period for approval); --draft reverts to Draft
+  ubw submit [DATE] [--draft]               set the rows and the period to Ready and save (sends for approval); --draft takes the period back
   ubw logout                                forget session and browser profile
 
 DATE is YYYY-MM-DD, today or yesterday. Add --json for machine output.

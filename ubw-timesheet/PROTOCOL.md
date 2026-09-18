@@ -108,7 +108,8 @@ work order. Postbacks used:
 | Edit an existing row | `<grid>rowN$_edit` | `undefined` | |
 | Change hours | any; the server reads all posted values | | `…$reg_valueK$i` = `8.00`, `IsDirty` = `true` |
 | Save | `b$tblsysSave` | `undefined` | may carry changed values in the same post |
-| Ready / Draft | button whose onclick has `action:SetSubmitStatus` / `action:SetDraftStatus` | that action string | `<grid>rowN$_delete=on` for each selected row, then Save |
+| Ready / Draft (rows) | button whose onclick has `action:SetSubmitStatus` / `action:SetDraftStatus` | that action string | `<grid>rowN$_delete=on` for each selected row, then Save |
+| Ready / Draft (period) | `<hdr>1551$Control` | `validate` | `…$1551$Editor` and `…$1551$RowDescription` = the label, `…$1551$RowValue` = `N` or `P`, `IsDirty` = `true`, then Save |
 | Delete rows | `<grid>buttons$_deleteButton` | `undefined` | `<grid>rowN$_delete=on`, then Save |
 
 Responses carry the outcome in three places:
@@ -117,9 +118,24 @@ Responses carry the outcome in three places:
   example `Activity: Illegal value for the project` when a work order was
   posted without `RowValue`.
 - A script `U4.selfservice.displayRiaMsg({ title:'Success', message:'Timesheet for X in period 202643 has been saved as a draft', messageType:'success' ...})`
-  after Save; after Ready + Save the message ends with "has been sent for
-  approval".
+  after Save. The wording after a status change tells you how far the change
+  got: "Parts of the timesheet for X in period 202643 have been sent for
+  approval" when the rows are Ready under a Draft header, and "Timesheet for X
+  in period 202643 has been sent for approval" when the header is Ready too.
 - The re-rendered grid itself.
+
+## Two statuses
+
+A period holds a status in the header field and a status on each grid row, and
+approval needs both at `Ready`. The grid buttons move the rows, the header
+field moves the period. A submit therefore presses the row button first and
+sets the header field after that; a period left with Ready rows under a Draft
+header stays with the employee.
+
+The way back is not symmetric. A row that is already Ready keeps that status:
+the Draft button returns no message for it, whether the header is Ready or
+Draft at the time of the post. Only the header goes back to `P`, so the
+approver has to reject the timesheet to make the rows editable again.
 
 ## Work order lookup
 
