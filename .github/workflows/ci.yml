@@ -14,11 +14,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-        node: [18, 22]
+        node: [24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
+      - run: npm install -g agent-browser
+      - run: agent-browser install --with-deps
+        if: runner.os == 'Linux'
+      - run: agent-browser install
+        if: runner.os != 'Linux'
       - run: node --check ubw-timesheet/scripts/ubw.mjs
       - run: node test/smoke.mjs

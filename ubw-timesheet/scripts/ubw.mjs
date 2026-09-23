@@ -1,26 +1,33 @@
 #!/usr/bin/env node
 // ubw.mjs - Unit4 ERP (Business World) timesheet CLI.
 //
-// The "Timesheets - standard" screen (menu TS1611) is an ASP.NET WebForms page.
-// This tool sends the same postbacks the browser sends, over plain HTTPS, and
-// parses the returned HTML. Node >= 18, no dependencies. See ../PROTOCOL.md.
+// Works the "Timesheets - standard" screen (menu TS1611) the way a person
+// does: it drives a real browser through the agent-browser CLI, clicks the
+// screen's buttons, and types into its fields. It never posts forms or calls
+// Unit4 endpoints itself. Page state is read from the rendered DOM. Node >= 18,
+// no npm dependencies; agent-browser must be on PATH. See ../SCREEN.md.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import http from "node:http";
-import https from "node:https";
-import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const HOME_DIR = process.env.UBW_HOME || path.join(os.homedir(), ".ubw-timesheet");
 const CONFIG_FILE = path.join(HOME_DIR, "config.json");
-const SESSION_FILE = path.join(HOME_DIR, "session.json");
-const PROFILE_DIR = path.join(HOME_DIR, "browser-profile");
+const STATE_FILE = path.join(HOME_DIR, "browser-state.json");
+const SESSION = process.env.UBW_SESSION || "ubw-timesheet";
 const DEFAULT_URL = "https://ubw.unit4cloud.com/nl_mcw_prod_web";
 const DEFAULT_MENU = "TS1611";
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+// The timesheet screen lives in this iframe of Container.aspx.
+const FRAME = "#contentContainerFrame";
+// Every click and keystroke goes to the element that carries this attribute.
+const TARGET_ATTR = "data-ubw-target";
+// Sign-in pages. Headless runs abort them, so an expired sign-in never reaches
+// Microsoft (and never sends an MFA prompt) outside the login command.
+const SIGN_IN_PAGES = ["https://login.microsoftonline.com/**", "https://login.live.com/**"];
+const SELECT_ALL = process.platform === "darwin" ? "Meta+a" : "Control+a";
+const INSTALL_HINT = "Install it with: npm install -g agent-browser && agent-browser install";
 
 class UbwError extends Error {
   constructor(message, { exitCode = 1, details } = {}) {
@@ -34,9 +41,14 @@ class NeedsLogin extends UbwError {
     super(message, { exitCode: 2 });
   }
 }
+class NeedsAgentBrowser extends UbwError {
+  constructor(detail = "") {
+    super(`agent-browser is not installed or not on PATH${detail ? ` (${detail})` : ""}. ${INSTALL_HINT}`, { exitCode: 3 });
+  }
+}
 
 // ---------------------------------------------------------------------------
-// Config and session files
+// Config files
 
 function readJson(file, fallback) {
   try {
@@ -53,173 +65,241 @@ function loadConfig() {
   const cfg = readJson(CONFIG_FILE, {});
   return { baseUrl: DEFAULT_URL, menuId: DEFAULT_MENU, ...cfg };
 }
+function containerUrl(config) {
+  const client = config.client ? `&client=${encodeURIComponent(config.client)}` : "";
+  return `${config.baseUrl}/Container.aspx?type=topgen&menu_id=${encodeURIComponent(config.menuId)}&activityStepId=1-1&addLaunchIndication=false${client}`;
+}
 
 // ---------------------------------------------------------------------------
-// HTTP
+// agent-browser
 
-function httpRequest(method, url, { headers = {}, body } = {}) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(url);
-    const mod = u.protocol === "http:" ? http : https;
-    const req = mod.request(
-      u,
-      {
-        method,
-        headers: {
-          "user-agent": USER_AGENT,
-          accept: "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-          ...headers,
-          ...(body != null ? { "content-length": Buffer.byteLength(body) } : {}),
-        },
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () =>
-          resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString("utf8") }),
-        );
-      },
-    );
-    req.on("error", reject);
-    if (body != null) req.write(body);
-    req.end();
-  });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// npm installs agent-browser as a .cmd shim on Windows, which only starts
+// through the shell. Arguments are selectors, dates, codes, and base64, so
+// double quotes are enough there.
+function winQuote(a) {
+  return /^[\w@%+=:,./\[\]#-]+$/.test(a) ? a : `"${a.replace(/"/g, '""')}"`;
 }
 
-// Cookie jar for the app host and the identity server host.
-class Jar {
-  constructor(cookies = []) {
-    this.cookies = cookies; // [{ name, value, domain, path }]
-  }
-  static fromCdp(cookies, registrableDomain) {
-    const jar = new Jar();
-    for (const c of cookies) {
-      const domain = c.domain.replace(/^\./, "");
-      if (domain === registrableDomain || domain.endsWith("." + registrableDomain)) jar.add({ name: c.name, value: c.value, domain, path: c.path || "/" });
-    }
-    return jar;
-  }
-  add(cookie) {
-    this.cookies = this.cookies.filter((c) => !(c.name === cookie.name && c.domain === cookie.domain && c.path === cookie.path));
-    if (cookie.value !== "") this.cookies.push(cookie);
-  }
-  header(url) {
-    const u = new URL(url);
-    return this.cookies
-      .filter((c) => (u.hostname === c.domain || u.hostname.endsWith("." + c.domain)) && u.pathname.startsWith(c.path))
-      .map((c) => `${c.name}=${c.value}`)
-      .join("; ");
-  }
-  absorb(url, setCookieHeaders) {
-    const u = new URL(url);
-    let changed = false;
-    for (const sc of [].concat(setCookieHeaders || [])) {
-      const [kv, ...attrs] = sc.split(";").map((s) => s.trim());
-      const i = kv.indexOf("=");
-      if (i <= 0) continue;
-      const attr = (n) => (attrs.find((a) => a.toLowerCase().startsWith(n + "=")) || "").slice(n.length + 1);
-      const expires = attr("expires");
-      const maxAge = attr("max-age");
-      const expired = (maxAge !== "" && Number(maxAge) <= 0) || (expires && new Date(expires) < new Date());
-      this.add({ name: kv.slice(0, i), value: expired ? "" : kv.slice(i + 1), domain: (attr("domain") || u.hostname).replace(/^\./, ""), path: attr("path") || "/" });
-      changed = true;
-    }
-    return changed;
-  }
-  has(host, name) {
-    return this.cookies.some((c) => c.name === name && (host === c.domain || host.endsWith("." + c.domain)));
-  }
+function agentBrowser(args, { timeout = 90000 } = {}) {
+  const argv = ["--session", SESSION, ...args];
+  const win = process.platform === "win32";
+  const r = spawnSync("agent-browser", win ? argv.map(winQuote) : argv, { encoding: "utf8", timeout, shell: win, windowsHide: true });
+  if (r.error?.code === "ENOENT") throw new NeedsAgentBrowser();
+  if (r.error) throw new UbwError(`agent-browser ${args[0]} failed: ${r.error.message}`);
+  if (win && r.status === 1 && /not recognized|cannot find/i.test(r.stderr || "")) throw new NeedsAgentBrowser();
+  return { status: r.status, stdout: (r.stdout || "").trim(), stderr: (r.stderr || "").trim() };
 }
 
-class Session {
-  constructor(config, jar) {
-    this.config = config;
-    this.jar = jar;
-  }
+// Runs a command with --json and returns its data; throws on failure.
+function ab(args, opts) {
+  const r = agentBrowser([...args, "--json"], opts);
+  let j = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {}
+  if (!j || !j.success) throw new UbwError(`agent-browser ${args[0]} failed: ${j?.error || r.stderr || r.stdout || `exit ${r.status}`}`);
+  return j.data;
+}
 
-  static load() {
-    const config = loadConfig();
-    const saved = readJson(SESSION_FILE, null);
-    if (!saved || !Array.isArray(saved.cookies) || !saved.cookies.length) throw new NeedsLogin();
-    return new Session(config, new Jar(saved.cookies));
-  }
+function checkAgentBrowser() {
+  const r = spawnSync("agent-browser", ["--version"], { encoding: "utf8", shell: process.platform === "win32", windowsHide: true });
+  if (r.error || r.status !== 0) throw new NeedsAgentBrowser(r.error?.code || (r.stderr || "").trim());
+  return (r.stdout || "").trim();
+}
 
-  save() {
-    writeJson(SESSION_FILE, { cookies: this.jar.cookies, updatedAt: new Date().toISOString() });
-  }
-
-  url(p) {
-    return p.startsWith("http") ? p : this.config.baseUrl + p;
-  }
-
-  // raw: return redirects and errors as-is instead of turning them into NeedsLogin.
-  async request(method, p, { form, headers = {}, raw = false } = {}) {
-    const url = this.url(p);
-    const res = await httpRequest(method, url, {
-      headers: {
-        cookie: this.jar.header(url),
-        referer: this.config.baseUrl + "/Default.aspx",
-        ...(form != null ? { "content-type": "application/x-www-form-urlencoded", origin: new URL(url).origin } : {}),
-        ...headers,
-      },
-      body: form,
-    });
-    if (this.jar.absorb(url, res.headers["set-cookie"])) this.save();
-    if (!raw && (res.status === 302 || res.status === 401 || res.status === 403)) {
-      const loc = res.headers.location || "";
-      if (res.status !== 302 || /Login|identity|login\.microsoftonline/i.test(loc)) throw new NeedsLogin();
-    }
-    return res;
-  }
-
-  get(p) {
-    return this.request("GET", p);
-  }
-  post(p, fields) {
-    return this.request("POST", p, { form: new URLSearchParams(fields).toString() });
-  }
-
-  async info() {
-    const res = await this.request("GET", "/api/session/current", { headers: { accept: "application/json" } });
-    let data;
+// Closes this tool's browser session and waits until agent-browser has let go
+// of it; a launch right after `close` otherwise fails to connect.
+async function closeSession() {
+  const active = () => {
+    const r = agentBrowser(["session", "list", "--json"]);
     try {
-      data = JSON.parse(res.text);
-    } catch {
-      throw new NeedsLogin();
-    }
-    if (!data.active) throw new NeedsLogin();
-    return data;
-  }
-
-  // Silent renewal: the app sends us to Unit4 Identity Services, which answers
-  // with a self-posting token form as long as its own session cookie is
-  // valid. No Microsoft round trip, so no MFA prompt. Returns false when the
-  // identity server wants a real login.
-  async renew() {
-    const appHost = new URL(this.config.baseUrl).hostname;
-    this.jar.cookies = this.jar.cookies.filter((c) => !(appHost === c.domain || appHost.endsWith("." + c.domain))); // start the app side clean
-    const returnPath = new URL(this.config.baseUrl).pathname + "/Default.aspx";
-    const first = await this.request("GET", `/Login/Login.aspx?ReturnUrl=${encodeURIComponent(returnPath)}`, { raw: true });
-    const authorize = first.status === 302 ? first.headers.location : null;
-    if (!authorize || !/\/connect\/authorize/.test(authorize)) return false;
-    const ids = await this.request("GET", authorize, { raw: true });
-    if (ids.status !== 200) return false; // 302 means "go to Microsoft": stop here
-    const action = (ids.text.match(/<form[^>]*action=['"]([^'"]+)['"]/) || [])[1];
-    const fields = [...ids.text.matchAll(/<input[^>]*name=['"]([^'"]+)['"][^>]*value=['"]([^'"]*)['"]/g)].map((m) => [m[1], decodeEntities(m[2])]);
-    if (!action || !fields.some(([k]) => k === "id_token" || k === "code")) return false;
-    const back = await this.request("POST", decodeEntities(action), { raw: true, form: new URLSearchParams(fields).toString(), headers: { referer: new URL(authorize).origin + "/" } });
-    if (back.status !== 302 || !this.jar.has(new URL(this.config.baseUrl).hostname, ".ASPXAUTH")) return false;
-    try {
-      await this.info();
-      return true;
+      return JSON.parse(r.stdout).data.sessions.some((s) => (s.name ?? s.session ?? s) === SESSION);
     } catch {
       return false;
     }
+  };
+  if (!active()) return;
+  agentBrowser(["close"]);
+  for (let i = 0; i < 40 && active(); i++) await sleep(250);
+  await sleep(300);
+}
+
+const idOf = (name) => name.replace(/\$/g, "_");
+
+// One browser session on the timesheet screen. Every change goes through a
+// real click or keystroke; JavaScript only reads the page and marks the
+// element the next click or keystroke goes to.
+class Ui {
+  constructor(config, { headed }) {
+    this.config = config;
+    this.headed = headed;
   }
 
-  screenPath() {
-    const { menuId, client } = this.config;
-    return `/ContentContainer.aspx?type=topgen&menu_id=${menuId}&activityStepId=1-1&addLaunchIndication=false&client=${client}`;
+  static async open(config, { headed = false } = {}) {
+    checkAgentBrowser();
+    // A session left over from an interrupted run would ignore --state.
+    await closeSession();
+    const launch = [];
+    if (fs.existsSync(STATE_FILE)) launch.push("--state", STATE_FILE);
+    if (headed) launch.push("--headed");
+    ab([...launch, "open", "about:blank"]);
+    const ui = new Ui(config, { headed });
+    if (!headed) for (const page of SIGN_IN_PAGES) ab(["network", "route", page, "--abort"]);
+    return ui;
+  }
+
+  url() {
+    return ab(["get", "url"]).url ?? "";
+  }
+
+  js(code) {
+    return ab(["eval", "-b", Buffer.from(code, "utf8").toString("base64")]).result;
+  }
+
+  // Runs `body` with `d` bound to the timesheet document.
+  frameJs(body) {
+    return this.js(`(() => { const f = document.querySelector(${JSON.stringify(FRAME)}); const d = f && f.contentDocument; if (!d) return null; ${body} })()`);
+  }
+
+  // The screen's postback counter once its document has loaded, else null.
+  counter() {
+    return this.frameJs(`const i = d.readyState === "complete" && d.querySelector("[name=postbackCounter]"); return i ? Number(i.value) : null;`);
+  }
+
+  async waitFor(test, what, ms = 60000) {
+    const end = Date.now() + ms;
+    for (;;) {
+      const v = test();
+      if (v) return v;
+      if (Date.now() > end) throw new UbwError(`Timed out waiting for ${what}.`);
+      await sleep(250);
+    }
+  }
+
+  // Opens the timesheet screen. Unit4 renews an expired app session through
+  // its identity server on its own; when that needs Microsoft, the aborted
+  // sign-in page ends the wait.
+  async openScreen() {
+    const target = containerUrl(this.config);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      agentBrowser(["open", target]);
+      const end = Date.now() + 60000;
+      while (Date.now() < end) {
+        if (this.counter() != null) return this.screen();
+        const url = this.url();
+        if (!this.headed && !/^https:\/\/[^/]*unit4cloud\.com\//.test(url) && url !== "about:blank") throw new NeedsLogin();
+        if (url.startsWith(this.config.baseUrl) && !/\/(Container|Login)\b|\/ContentContainer/i.test(url) && /\.aspx/i.test(url)) break; // landed on the home page after renewal
+        await sleep(500);
+      }
+    }
+    throw new NeedsLogin("The timesheet screen did not load. Run the login command.");
+  }
+
+  screen() {
+    const html = this.frameJs(`return d.documentElement.outerHTML;`);
+    if (!html) throw new UbwError("Timesheet screen not loaded.");
+    return new Screen(html);
+  }
+
+  // Marks the element that `findBody` returns (it sees `d`); throws when absent.
+  mark(findBody, what) {
+    const ok = this.frameJs(
+      `d.querySelectorAll("[${TARGET_ATTR}]").forEach((e) => e.removeAttribute("${TARGET_ATTR}")); const el = (() => { ${findBody} })(); if (!el) return false; el.setAttribute("${TARGET_ATTR}", ""); return true;`,
+    );
+    if (!ok) throw new UbwError(`${what} not found on the timesheet screen.`);
+  }
+  markId(id, what) {
+    this.mark(`return d.getElementById(${JSON.stringify(id)});`, what);
+  }
+
+  act(...args) {
+    ab(["frame", FRAME]);
+    ab([args[0], `[${TARGET_ATTR}]`, ...args.slice(1)]);
+  }
+
+  // Runs `fn` (a click or keystroke) and waits for the postback it causes.
+  async postback(fn, what) {
+    const before = this.counter();
+    fn();
+    await this.waitFor(() => {
+      const n = this.counter();
+      return n != null && n > before;
+    }, what);
+    return this.screen();
+  }
+
+  click(what) {
+    return this.postback(() => this.act("click"), what);
+  }
+
+  // Types into the marked field like a person: focus, select the old value,
+  // type, and leave with Tab. Tab fires the field's change event.
+  typeKeys(text) {
+    ab(["frame", FRAME]);
+    ab(["focus", `[${TARGET_ATTR}]`]);
+    ab(["press", SELECT_ALL]);
+    ab(["keyboard", "type", text]);
+    ab(["press", "Tab"]);
+  }
+  type(text, what) {
+    return this.postback(() => this.typeKeys(text), what);
+  }
+
+  async save() {
+    this.markId("b$tblsysSave", "Save button");
+    return this.click("Save");
+  }
+
+  // Loads the period that contains `date` by typing it into "Date in period".
+  async goto(date) {
+    let s = this.screen();
+    if (s.dayColumn(date)) return s;
+    this.markId(idOf(s.names.header + "date_in_period$i"), "Date in period field");
+    s = await this.type(formatDate(date, s.regional.datePattern), "the period to load");
+    if (!s.dayColumn(date)) throw new UbwError(`Unit4 did not load the period of ${isoDate(date)} (showing ${s.period}).`, { details: s.messages });
+    return s;
+  }
+
+  // Opens the row's details (Zoom), reads Sum and Inv.value, closes the dialog.
+  async invoiceValue(row) {
+    this.markId(idOf(row.name) + "_zoom", "Zoom button");
+    const s = await this.click("the row details");
+    const pick = (suffix) => Object.entries(s.fields).find(([k]) => !k.startsWith(s.names.grid) && k.endsWith(suffix))?.[1];
+    const sum = pick("$reg_value$i"), inv = pick("$inv_value$i");
+    this.markId("b__dialogclose", "Close button of the row details");
+    await this.click("the row details to close");
+    if (sum == null || inv == null) throw new UbwError(`Could not read Sum and Inv.value of ${row.workOrder}.`);
+    return { sum, inv, match: parseHours(sum, s.regional.decimalSep) === parseHours(inv, s.regional.decimalSep) };
+  }
+
+  saveState() {
+    fs.mkdirSync(HOME_DIR, { recursive: true, mode: 0o700 });
+    ab(["state", "save", STATE_FILE]);
+    try {
+      fs.chmodSync(STATE_FILE, 0o600);
+    } catch {}
+  }
+
+  close() {
+    return closeSession();
+  }
+}
+
+// Opens the screen in a headless browser, runs fn, keeps the refreshed
+// cookies, and always closes the browser.
+async function withScreen(fn) {
+  const ui = await Ui.open(loadConfig());
+  try {
+    const screen = await ui.openScreen();
+    try {
+      return await fn(ui, screen);
+    } finally {
+      ui.saveState();
+    }
+  } finally {
+    await ui.close();
   }
 }
 
@@ -433,24 +513,14 @@ function formatHours(n, decimalSep) {
   return n.toFixed(2).replace(".", decimalSep);
 }
 
+
 // ---------------------------------------------------------------------------
-// The timesheet screen
+// The timesheet screen, parsed from the rendered DOM
 
 class Screen {
-  constructor(session, html) {
-    this.session = session;
+  constructor(html) {
     this.html = html;
     this.parse();
-  }
-
-  static async open(session, date) {
-    const res = await session.get(session.screenPath());
-    let screen = new Screen(session, res.text);
-    if (date && !screen.dayColumn(date)) {
-      const target = screen.names.header + "date_in_period";
-      screen = await screen.postback(target, undefined, { [target + "$i"]: formatDate(date, screen.regional.datePattern) });
-    }
-    return screen;
   }
 
   parse() {
@@ -483,6 +553,8 @@ class Screen {
     const periodName = headerList("Period");
     const statusName = headerList("Status");
     this.names.status = statusName || null;
+    const personName = headerList("Name");
+    this.person = personName ? { userId: this.fields[personName + "$RowValue"], name: this.fields[personName + "$RowDescription"] } : {};
     this.period = periodName ? this.fields[periodName + "$Editor"] : "";
     this.periodDescription = periodName ? this.fields[periodName + "$RowDescription"] : "";
     this.status = statusName ? { code: this.fields[statusName + "$RowValue"], label: this.fields[statusName + "$RowDescription"] } : {};
@@ -605,55 +677,9 @@ class Screen {
     return this.days.find((d) => d.date && isoDate(d.date) === isoDate(date)) || null;
   }
 
-  // Header status field: "P" Draft, "N" Ready. The label comes from the lookup,
-  // because the screen speaks the user's language. A save has to follow.
-  async setHeaderStatus(code) {
-    if (!this.names.status) throw new UbwError("Status field not found on the timesheet screen.");
-    const { items } = await this.lookup(this.names.status, "");
-    const option = items.find((i) => i.value === code);
-    if (!option) throw new UbwError(`Status ${code} is not offered for period ${this.period} (offered: ${items.map((i) => i.value).join(", ") || "none"}).`);
-    return this.postback(this.names.status + "$Control", "validate", {
-      [this.names.status + "$Editor"]: option.description,
-      [this.names.status + "$RowValue"]: option.value,
-      [this.names.status + "$RowDescription"]: option.description,
-    });
-  }
-
-  // One WebForms postback. `changes` are field values to set (marks their IsDirty flags).
-  async postback(target, argument, changes = {}) {
-    const body = { ...this.fields };
-    for (const [k, v] of Object.entries(changes)) {
-      body[k] = v;
-      const dirty = k.replace(/\$(i|Editor|RowValue|RowDescription)$/, "$IsDirty");
-      if (dirty !== k && dirty in body) body[dirty] = "true";
-    }
-    body.__EVENTTARGET = target;
-    body.__EVENTARGUMENT = argument ?? "undefined";
-    body.__LASTFOCUS = "";
-    body["b$TCFocusedField"] = target;
-    body["b$PageActiveElement"] = target;
-    body.postbackCounter = String(Number(body.postbackCounter || 0) + 1);
-    body.scrollPosA = "0,0";
-    body.scrollPosI = "undefined";
-    const res = await this.session.post(this.session.screenPath(), body);
-    return new Screen(this.session, res.text);
-  }
-
-  // Every call hits the server: work orders come and go, so nothing is cached.
-  // The server ignores BatchStart/BatchSize and returns at most 50 matches;
-  // `more` tells the caller to narrow the search.
-  async lookup(fieldName, text) {
-    const list = this.lists[fieldName];
-    if (!list) throw new UbwError(`No lookup control for ${fieldName}`);
-    const res = await this.session.post("/System/Services/DataListService.aspx", { Search: text, Context: list.context, BatchStart: "1", BatchSize: "50" });
-    const items = [...res.text.matchAll(/<item><value>([^<]*)<\/value><descr>([^<]*)<\/descr><\/item>/g)]
-      .map((m) => ({ value: decodeEntities(m[1]), description: decodeEntities(m[2]) }))
-      .filter((it) => it.description !== "[NEW]");
-    return { items, more: /<hasmoredata>True<\/hasmoredata>/i.test(res.text) };
-  }
-
-  listField(row, title) {
-    return Object.keys(this.lists).find((n) => n.startsWith(row.name + "$") && this.lists[n].title === title) || null;
+  who() {
+    if (!this.person.userId) throw new UbwError("The timesheet screen shows no employee.");
+    return this.person;
   }
 
   toJSON() {
@@ -690,174 +716,6 @@ function allTagsIn(html, el, name) {
 }
 
 // ---------------------------------------------------------------------------
-// Browser login: launch a Chromium browser with a private profile, wait for the
-// SSO round trip to land on the app, copy the cookies out over CDP (pipe).
-
-function findBrowser() {
-  if (process.env.UBW_BROWSER) return process.env.UBW_BROWSER;
-  const candidates = [];
-  if (process.platform === "win32") {
-    const roots = [process.env["ProgramFiles"], process.env["ProgramFiles(x86)"], process.env["LocalAppData"]].filter(Boolean);
-    for (const root of roots) {
-      candidates.push(
-        path.join(root, "Google/Chrome/Application/chrome.exe"),
-        path.join(root, "Microsoft/Edge/Application/msedge.exe"),
-        path.join(root, "BraveSoftware/Brave-Browser/Application/brave.exe"),
-        path.join(root, "Chromium/Application/chrome.exe"),
-      );
-    }
-  } else if (process.platform === "darwin") {
-    candidates.push(
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-      "/Applications/Chromium.app/Contents/MacOS/Chromium",
-      "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-      path.join(os.homedir(), "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-    );
-  } else {
-    const names = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable", "brave-browser"];
-    for (const dir of (process.env.PATH || "").split(path.delimiter)) for (const n of names) candidates.push(path.join(dir, n));
-    candidates.push("/opt/google/chrome/chrome", "/opt/microsoft/msedge/msedge");
-  }
-  for (const c of candidates) {
-    try {
-      fs.accessSync(c, fs.constants.X_OK);
-      return c;
-    } catch {}
-  }
-  throw new UbwError("No Chromium-based browser found (Chrome, Edge, Brave, Chromium). Set UBW_BROWSER=<path to browser executable>.");
-}
-
-class BrowserCdp {
-  constructor(exe, args, { headless = false } = {}) {
-    const flags = [
-      `--user-data-dir=${PROFILE_DIR}`,
-      "--remote-debugging-pipe",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-sync",
-      "--window-size=1100,900",
-      ...(process.platform === "linux" ? ["--password-store=basic"] : []),
-      ...(headless ? ["--headless=new"] : []),
-      ...args,
-    ];
-    this.child = spawn(exe, flags, { stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"], windowsHide: !!headless });
-    this.exited = new Promise((resolve) => this.child.on("exit", resolve));
-    this.child.on("error", () => {});
-    this.seq = 0;
-    this.pending = new Map();
-    let buf = "";
-    this.child.stdio[4].on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-      let i;
-      while ((i = buf.indexOf("\0")) >= 0) {
-        const msg = buf.slice(0, i);
-        buf = buf.slice(i + 1);
-        try {
-          const m = JSON.parse(msg);
-          const p = this.pending.get(m.id);
-          if (p) {
-            this.pending.delete(m.id);
-            m.error ? p.reject(new Error(m.error.message)) : p.resolve(m.result);
-          }
-        } catch {}
-      }
-    });
-  }
-  send(method, params = {}) {
-    return new Promise((resolve, reject) => {
-      const id = ++this.seq;
-      this.pending.set(id, { resolve, reject });
-      this.child.stdio[3].write(JSON.stringify({ id, method, params }) + "\0");
-      setTimeout(() => {
-        if (this.pending.delete(id)) reject(new Error(`CDP timeout: ${method}`));
-      }, 10000);
-    });
-  }
-  async close() {
-    try {
-      await Promise.race([this.send("Browser.close"), new Promise((r) => setTimeout(r, 2000))]);
-    } catch {}
-    setTimeout(() => {
-      try {
-        this.child.kill("SIGKILL");
-      } catch {}
-    }, 3000).unref();
-    await Promise.race([this.exited, new Promise((r) => setTimeout(r, 4000))]);
-  }
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function registrableDomain(baseUrl) {
-  return new URL(baseUrl).hostname.split(".").slice(-2).join(".");
-}
-
-// Opens a browser window on the app, waits for the SSO round trip to land,
-// and returns a Session built from the browser's cookies (app + identity
-// server). Null when the user did not finish in time.
-async function browserLogin(config, { timeoutMs, log }) {
-  const exe = findBrowser();
-  const landing = config.baseUrl + "/Default.aspx";
-  const browser = new BrowserCdp(exe, [landing], { headless: false });
-  const deadline = Date.now() + timeoutMs;
-  try {
-    try {
-      await browser.send("Target.getTargets");
-    } catch (e) {
-      throw new UbwError(`Browser did not answer over the debugging pipe (${exe}): ${e.message}`);
-    }
-    log("A browser window opened. Log in there; this command continues when the timesheet app loads.");
-    while (Date.now() < deadline) {
-      await sleep(700);
-      let targets;
-      try {
-        targets = (await browser.send("Target.getTargets")).targetInfos;
-      } catch {
-        break; // browser closed by the user
-      }
-      const onApp = targets.some((t) => t.type === "page" && t.url.startsWith(config.baseUrl) && !/\/Login\//i.test(t.url));
-      if (!onApp) continue;
-      const { cookies } = await browser.send("Storage.getCookies");
-      const jar = Jar.fromCdp(cookies, registrableDomain(config.baseUrl));
-      if (!jar.has(new URL(config.baseUrl).hostname, ".ASPXAUTH")) continue;
-      const session = new Session(config, jar);
-      try {
-        await session.info();
-        return session;
-      } catch {
-        /* the app is still finishing the login */
-      }
-    }
-    return null;
-  } finally {
-    await browser.close();
-  }
-}
-
-function persist(session, info) {
-  session.config = { ...session.config, client: info.client, userId: info.userId };
-  writeJson(CONFIG_FILE, { baseUrl: session.config.baseUrl, menuId: session.config.menuId, client: info.client, userId: info.userId });
-  session.save();
-  return session;
-}
-
-// Silent path first (identity server session), browser window only when asked.
-async function ensureLoggedIn(config, { interactive, log }) {
-  let session = null;
-  try {
-    session = Session.load();
-  } catch {
-    /* no stored session */
-  }
-  if (session && (await session.renew().catch(() => false))) return persist(session, await session.info());
-  if (!interactive) throw new NeedsLogin();
-  session = await browserLogin(config, { timeoutMs: 5 * 60 * 1000, log });
-  if (!session) throw new NeedsLogin("Sign-in did not finish within 5 minutes. Run the login command again.");
-  return persist(session, await session.info());
-}
-
-// ---------------------------------------------------------------------------
 // Commands
 
 function parseArgs(argv) {
@@ -868,23 +726,11 @@ function parseArgs(argv) {
     if (a.startsWith("--")) {
       const [k, v] = a.slice(2).split(/=(.*)/s);
       if (v != null) flags[k] = v;
-      else if (i + 1 < argv.length && !argv[i + 1].startsWith("--") && !["json", "help", "draft", "fresh"].includes(k)) flags[k] = argv[++i];
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith("--") && !["json", "help", "fresh", "dry-run"].includes(k)) flags[k] = argv[++i];
       else flags[k] = true;
     } else positional.push(a);
   }
   return { flags, positional };
-}
-
-async function withSession(flags, fn) {
-  let session;
-  try {
-    session = Session.load();
-    await session.info();
-  } catch (e) {
-    if (!(e instanceof NeedsLogin)) throw e;
-    session = await ensureLoggedIn(loadConfig(), { interactive: false, log: (m) => console.error(m) });
-  }
-  return fn(session);
 }
 
 const out = {
@@ -934,236 +780,272 @@ function printScreen(screen, flags) {
   for (const l of describeMessages(screen.messages)) console.log(l);
 }
 
+function rowByWorkOrder(screen, workOrder) {
+  return screen.findRow(workOrder, "0");
+}
+
+// Marks row `row`'s cell in `column` (td), for a click that opens the row for editing.
+function markCell(ui, row, column) {
+  ui.mark(
+    `const tr = d.getElementById(${JSON.stringify(idOf(row.name))}); const i = [...d.querySelectorAll("tr.Header th")].findIndex((th) => th.dataset.fieldname === ${JSON.stringify(column)}); return tr && i >= 0 ? tr.children[i] : null;`,
+    `Cell ${column} of ${row.workOrder}`,
+  );
+}
+
 const commands = {
   async login({ flags }) {
     const config = loadConfig();
     if (flags.url) config.baseUrl = String(flags.url).replace(/\/+$/, "");
     if (flags.menu) config.menuId = String(flags.menu);
-    if (flags.url || flags.menu) writeJson(CONFIG_FILE, { ...readJson(CONFIG_FILE, {}), baseUrl: config.baseUrl, menuId: config.menuId });
-    if (flags.cookie) {
-      // Escape hatch: paste the Cookie header of a logged-in request to the app.
-      const jar = new Jar();
-      const host = new URL(config.baseUrl).hostname;
-      for (const part of String(flags.cookie).split(";")) {
-        const i = part.indexOf("=");
-        if (i > 0) jar.add({ name: part.slice(0, i).trim(), value: part.slice(i + 1).trim(), domain: host, path: "/" });
-      }
-      const session = new Session(config, jar);
-      const info = await session.info();
-      persist(session, info);
-      return out.json({ ok: true, userId: info.userId, client: info.client, renewable: false });
+    if (flags.fresh) fs.rmSync(STATE_FILE, { force: true });
+    const ui = await Ui.open(config, { headed: true });
+    try {
+      agentBrowser(["open", `${config.baseUrl}/Default.aspx`]);
+      console.error("A browser window opened. Sign in there; this command continues when Unit4 has loaded.");
+      const onApp = () => {
+        const url = ui.url();
+        return url.startsWith(config.baseUrl) && !/\/Login\//i.test(url);
+      };
+      await ui.waitFor(onApp, "the Unit4 sign-in", 5 * 60 * 1000).catch(() => {
+        throw new NeedsLogin("Sign-in did not finish within 5 minutes. Run the login command again.");
+      });
+      const screen = await ui.openScreen();
+      const who = screen.who();
+      writeJson(CONFIG_FILE, { ...readJson(CONFIG_FILE, {}), baseUrl: config.baseUrl, menuId: config.menuId, userId: who.userId });
+      ui.saveState();
+      out.json({ ok: true, ...who, baseUrl: config.baseUrl });
+    } finally {
+      await ui.close();
     }
-    if (flags.fresh) fs.rmSync(SESSION_FILE, { force: true });
-    const session = await ensureLoggedIn(config, { interactive: true, log: (m) => console.error(m) });
-    const info = await session.info();
-    out.json({ ok: true, userId: info.userId, client: info.client, baseUrl: config.baseUrl, sessionMinutesLeft: Math.round(info.timeleft / 6e8) });
   },
 
   async logout() {
-    for (const f of [SESSION_FILE]) fs.rmSync(f, { force: true });
-    fs.rmSync(PROFILE_DIR, { recursive: true, force: true });
+    await closeSession();
+    fs.rmSync(STATE_FILE, { force: true });
+    fs.rmSync(path.join(HOME_DIR, "session.json"), { force: true });
+    fs.rmSync(path.join(HOME_DIR, "browser-profile"), { recursive: true, force: true });
     out.json({ ok: true });
   },
 
-  async whoami({ flags }) {
-    await withSession(flags, async (session) => {
-      const info = await session.info();
-      out.json({ userId: info.userId, client: info.client, baseUrl: session.config.baseUrl, sessionMinutesLeft: Math.round(info.timeleft / 6e8) });
-    });
+  async whoami() {
+    await withScreen(async (ui, screen) => out.json({ ...screen.who(), baseUrl: ui.config.baseUrl, period: screen.period }));
   },
 
   async show({ flags, positional }) {
     const date = parseIsoDate(positional[0] || "today");
-    await withSession(flags, async (session) => {
-      const screen = await Screen.open(session, date);
-      printScreen(screen, flags);
-    });
+    await withScreen(async (ui) => printScreen(await ui.goto(date), flags));
   },
 
+  // Types the keyword into the work-order field of a new row and reads the
+  // list the field drops down. The row is never saved.
   async search({ flags, positional }) {
     const text = positional.join(" ");
     if (!text) throw new UbwError("Usage: ubw search <text>");
-    await withSession(flags, async (session) => {
-      let screen = await Screen.open(session);
-      screen = await screen.postback(screen.buttons.add); // an empty row gives an unfiltered lookup
-      const row = screen.editingRow;
-      const field = row && screen.listField(row, "Work order");
-      if (!field) throw new UbwError("Could not open a lookup row.");
-      // The server matches the whole phrase; query the longest word and filter on the rest here.
-      const words = text.split(/\s+/).filter(Boolean);
-      const query = words.reduce((a, b) => (b.length > a.length ? b : a));
-      const found = await screen.lookup(field, query);
-      const items = found.items.filter((i) => words.every((w) => (i.value + " " + i.description).toLowerCase().includes(w.toLowerCase())));
-      if (flags.json) return out.json({ query, truncated: found.more, items });
+    const words = text.split(/\s+/).filter(Boolean);
+    const query = words.reduce((a, b) => (b.length > a.length ? b : a));
+    await withScreen(async (ui, screen) => {
+      if (!screen.buttons.add) throw new UbwError(`Period ${screen.period} is ${screen.status.label}; search needs a period where rows can be added.`);
+      ui.markId(idOf(screen.buttons.add), "Add button");
+      const s = await ui.click("the new row");
+      const input = s.editingRow?.cells.work_order?.input;
+      if (!input) throw new UbwError("The new row has no work order field.");
+      const popup = JSON.stringify(idOf(input).replace(/_Editor$/, "_Popup"));
+      // The drop-down holds option rows, or only a notice such as "Too many
+      // values. Please narrow your search."
+      const listed = () =>
+        ui.frameJs(
+          `const p = d.getElementById(${popup}); if (!p) return null; const rows = [...p.querySelectorAll("tr[role=option]")].map((tr) => [...tr.cells].map((c) => c.textContent.trim())); if (rows.length && p.offsetParent) return { rows }; const notice = p.innerText.trim(); return notice ? { notice } : null;`,
+        );
+      ui.markId(idOf(input), "Work order field");
+      ab(["frame", FRAME]);
+      ab(["focus", `[${TARGET_ATTR}]`]);
+      ab(["keyboard", "type", query]);
+      let list = null;
+      for (let attempt = 0; attempt < 3 && !list; attempt++) {
+        const end = Date.now() + 4000;
+        while (!list && Date.now() < end) {
+          await sleep(250);
+          list = listed();
+        }
+        // The drop-down sometimes misses the first keystrokes; type once more.
+        if (!list) {
+          ab(["press", "End"]);
+          ab(["keyboard", "type", "x"]);
+          ab(["press", "Backspace"]);
+        }
+      }
+      if (!list) throw new UbwError(`The work order field showed no list for "${query}".`);
+      if (!list.rows) throw new UbwError(`Unit4 says for "${query}": ${list.notice} Use a longer or more specific word.`);
+      const all = list.rows.filter((r) => r[1] !== "[NEW]").map(([value, description]) => ({ value, description: description ?? "" }));
+      const items = all.filter((i) => words.every((w) => (i.value + " " + i.description).toLowerCase().includes(w.toLowerCase())));
+      if (flags.json) return out.json({ query, items });
       if (!items.length) console.log("No matching work orders.");
       else out.table(items.map((i) => ({ workOrder: i.value, description: i.description })));
-      if (found.more) console.log(`Server capped "${query}" at 50 matches; use a more specific word to see the rest.`);
     });
   },
 
   async set({ flags, positional }) {
     const [workOrder, ...specs] = positional;
-    if (!workOrder || !specs.length) throw new UbwError("Usage: ubw set <work-order> <YYYY-MM-DD=hours> [more days...] [--timecode 0]");
-    const timecode = flags.timecode != null ? String(flags.timecode) : "0";
+    if (!workOrder || !specs.length) throw new UbwError("Usage: ubw set <work-order> <YYYY-MM-DD=hours> [more days...]");
     let entries = specs.map((s) => {
-      const m = /^([^=]+)=(-?\d+(?:[.,]\d+)?)$/.exec(s);
+      const m = /^([^=]+)=(\d+(?:[.,]\d+)?)$/.exec(s);
       if (!m) throw new UbwError(`Bad entry "${s}". Use YYYY-MM-DD=hours, e.g. 2026-09-07=8`);
       return { date: parseIsoDate(m[1]), hours: parseFloat(m[2].replace(",", ".")) };
     });
-    await withSession(flags, async (session) => {
+    await withScreen(async (ui) => {
       const results = [];
       while (entries.length) {
-        let screen = await Screen.open(session, entries[0].date);
-        const inPeriod = entries.filter((e) => screen.dayColumn(e.date));
-        if (!inPeriod.length) throw new UbwError(`Date ${isoDate(entries[0].date)} is not in period ${screen.period}.`);
+        let s = await ui.goto(entries[0].date);
+        const inPeriod = entries.filter((e) => s.dayColumn(e.date));
         entries = entries.filter((e) => !inPeriod.includes(e));
-
-        let row = screen.findRow(workOrder, timecode);
+        let row = rowByWorkOrder(s, workOrder);
         const wanted = inPeriod.filter((e) => !row || row.hours[isoDate(e.date)] !== e.hours);
         if (row && !wanted.length) {
-          // Nothing to write; the server stays silent on a save without changes.
-          results.push({ period: screen.period, changed: false, row: rowSummary(row), messages: screen.messages });
+          results.push({ period: s.period, changed: false, row: rowSummary(row), messages: s.messages });
           continue;
         }
         if (row && !row.editing) {
-          screen = await screen.postback(row.name + "$_edit");
-          row = screen.findRow(workOrder, timecode);
-          if (!row || !row.editing) throw new UbwError(`Row ${workOrder} in period ${screen.period} is not editable (status "${row?.status || "?"}").`, { details: screen.messages });
+          // Clicking a day cell opens the row for editing.
+          markCell(ui, row, s.dayColumn(wanted[0].date).column);
+          s = await ui.click(`row ${workOrder} to open for editing`);
+          row = rowByWorkOrder(s, workOrder);
+          if (!row || !row.editing || !row.cells[s.dayColumn(wanted[0].date).column]?.input)
+            throw new UbwError(`Row ${workOrder} in period ${s.period} is not editable (status "${row?.status || "?"}").`, { details: s.messages });
         }
         if (!row) {
-          if (!screen.buttons.add) throw new UbwError(`Period ${screen.period} is ${screen.status.label}; rows cannot be added.`);
-          screen = await screen.postback(screen.buttons.add);
-          const fresh = screen.editingRow;
-          if (!fresh) throw new UbwError("Could not add a row.", { details: screen.messages });
-          const woField = screen.listField(fresh, "Work order");
-          const changes = { [woField + "$Editor"]: workOrder, [woField + "$RowValue"]: workOrder };
-          if (timecode !== fresh.timecode) {
-            const tcField = screen.listField(fresh, "Time code");
-            changes[tcField + "$Editor"] = timecode;
-            changes[tcField + "$RowValue"] = timecode;
-          }
-          screen = await screen.postback(woField + "$Control", "validate", changes);
-          row = screen.findRow(workOrder, timecode);
-          if (!row || !row.editing) throw new UbwError(`Work order ${workOrder} was not accepted.`, { details: screen.messages });
+          if (!s.buttons.add) throw new UbwError(`Period ${s.period} is ${s.status.label}; rows cannot be added.`);
+          ui.markId(idOf(s.buttons.add), "Add button");
+          s = await ui.click("the new row");
+          const input = s.editingRow?.cells.work_order?.input;
+          if (!input) throw new UbwError("The new row has no work order field.", { details: s.messages });
+          ui.markId(idOf(input), "Work order field");
+          s = await ui.type(workOrder, "the work order to be accepted");
+          row = rowByWorkOrder(s, workOrder);
+          if (!row || !row.editing || s.messages.errors.length) throw new UbwError(`Work order ${workOrder} was not accepted.`, { details: s.messages });
         }
-        // Type each day the way the browser does: the cell's change event is a
-        // postback of its own, and the server computes the row's invoice value
-        // (Zoom > Inv.value) only there. Hours that ride on Save alone are stored
-        // with Inv.value 0, so the project gets them as negative invoice hours.
         for (const e of wanted) {
-          const input = screen.editingRow?.cells[screen.dayColumn(e.date).column]?.input;
+          const input = s.editingRow?.cells[s.dayColumn(e.date).column]?.input;
           if (!input) throw new UbwError(`No editable cell for ${isoDate(e.date)}.`);
-          screen = await screen.postback(input.slice(0, -"$i".length), undefined, { [input]: formatHours(e.hours, screen.regional.decimalSep) });
-          if (screen.messages.errors.length) throw new UbwError(`Unit4 rejected ${isoDate(e.date)}=${e.hours}: ${describeMessages(screen.messages).join(" | ")}`, { details: screen.messages });
+          ui.markId(idOf(input), `Hours field for ${isoDate(e.date)}`);
+          s = await ui.type(formatHours(e.hours, s.regional.decimalSep), `the hours for ${isoDate(e.date)}`);
+          if (s.messages.errors.length) throw new UbwError(`Unit4 rejected ${isoDate(e.date)}=${e.hours}.`, { details: s.messages });
         }
-        screen = await screen.postback(screen.buttons.save);
-        const saved = screen.findRow(workOrder, timecode);
-        results.push({ period: screen.period, changed: true, row: saved ? rowSummary(saved) : null, messages: screen.messages });
-        const mismatch = saved && wanted.find((e) => saved.hours[isoDate(e.date)] !== e.hours);
-        if (screen.messages.errors.length || screen.messages.result?.type !== "success" || !saved || mismatch) {
-          throw new UbwError(`Save failed for period ${screen.period}: ${describeMessages(screen.messages).join(" | ") || (mismatch ? `${isoDate(mismatch.date)} shows ${saved.hours[isoDate(mismatch.date)]} instead of ${mismatch.hours}` : "no confirmation from server")}`, { details: results });
-        }
-        // The invoice value is not in the grid; the row's Zoom dialog shows it.
-        // Right after Save the dialog shows zeros, so read it from a fresh load.
-        const reloaded = await Screen.open(session, inPeriod[0].date);
-        const stored = reloaded.findRow(workOrder, timecode);
-        if (!stored) throw new UbwError(`Row ${workOrder} is missing after reloading period ${reloaded.period}.`, { details: results });
-        const zoom = await reloaded.postback(stored.name + "$zoom", "action:Zoom");
-        const detail = (suffix) => Object.entries(zoom.fields).find(([k]) => !k.startsWith(zoom.names.grid) && k.endsWith(suffix))?.[1];
-        const sum = detail("$reg_value$i"), inv = detail("$inv_value$i");
-        if (sum == null || inv == null) throw new UbwError(`Could not read Inv.value for ${workOrder} in period ${screen.period}; check the row's Zoom dialog in Unit4.`, { details: results });
-        if (parseHours(inv, screen.regional.decimalSep) !== parseHours(sum, screen.regional.decimalSep))
-          throw new UbwError(`Period ${screen.period}: ${workOrder} saved with Sum ${sum} but Inv.value ${inv}; the project would invoice the wrong hours.`, { details: results });
+        s = await ui.save();
+        const saved = rowByWorkOrder(s, workOrder);
+        results.push({ period: s.period, changed: true, row: saved ? rowSummary(saved) : null, messages: s.messages });
+        if (s.messages.errors.length || s.messages.result?.type !== "success" || !saved)
+          throw new UbwError(`Save failed for period ${s.period}: ${describeMessages(s.messages).join(" | ") || "no confirmation from Unit4"}`, { details: results });
+        // Read back from a fresh load: hours per day and the invoice value.
+        await ui.openScreen();
+        s = await ui.goto(inPeriod[0].date);
+        const stored = rowByWorkOrder(s, workOrder);
+        const mismatch = stored ? wanted.find((e) => stored.hours[isoDate(e.date)] !== e.hours) : null;
+        if (!stored || mismatch) throw new UbwError(`Period ${s.period}: ${!stored ? `row ${workOrder} is missing after the save` : `${isoDate(mismatch.date)} shows ${stored.hours[isoDate(mismatch.date)]} instead of ${mismatch.hours}`}.`, { details: results });
+        const value = await ui.invoiceValue(stored);
+        if (!value.match) throw new UbwError(`Period ${s.period}: ${workOrder} saved with Sum ${value.sum} but Inv.value ${value.inv}; the project would invoice the wrong hours. Correct the row in the Unit4 web UI.`, { details: results });
       }
       if (flags.json) out.json(results);
-      else for (const r of results) {
-        console.log(r.changed ? r.messages.result.message : `Period ${r.period}: already had these hours, nothing saved`);
-        if (r.row) out.table([{ workOrder: r.row.workOrder, description: r.row.description.slice(0, 40), status: r.row.status, ...Object.fromEntries(Object.entries(r.row.hours).map(([d, h]) => [d.slice(5), h.toFixed(2)])), sum: r.row.sum.toFixed(2) }]);
-      }
+      else
+        for (const r of results) {
+          console.log(r.changed ? r.messages.result.message : `Period ${r.period}: already had these hours, nothing saved`);
+          if (r.row) out.table([{ workOrder: r.row.workOrder, description: r.row.description.slice(0, 40), status: r.row.status, ...Object.fromEntries(Object.entries(r.row.hours).map(([d, h]) => [d.slice(5), h.toFixed(2)])), sum: r.row.sum.toFixed(2) }]);
+        }
     });
   },
 
   async delete({ flags, positional }) {
     const [workOrder, dateArg] = positional;
-    if (!workOrder || !dateArg) throw new UbwError("Usage: ubw delete <work-order> <YYYY-MM-DD> [--timecode 0]");
-    const timecode = flags.timecode != null ? String(flags.timecode) : "0";
-    await withSession(flags, async (session) => {
-      let screen = await Screen.open(session, parseIsoDate(dateArg));
-      const row = screen.findRow(workOrder, timecode);
-      if (!row) throw new UbwError(`No row for ${workOrder} in period ${screen.period}.`);
-      if (!screen.buttons.delete) throw new UbwError(`Period ${screen.period} is ${screen.status.label}; rows cannot be removed.`);
-      screen = await screen.postback(screen.buttons.delete, undefined, { [row.name + "$_delete"]: "on" });
-      if (screen.findRow(workOrder, timecode)) throw new UbwError(`Row ${workOrder} could not be removed.`, { details: screen.messages });
-      screen = await screen.postback(screen.buttons.save);
-      if (flags.json) out.json({ period: screen.period, messages: screen.messages, rows: screen.toJSON().rows });
-      else printScreen(screen, flags);
-      if (screen.messages.errors.length) throw new UbwError("Save reported errors.", { details: screen.messages });
+    if (!workOrder || !dateArg) throw new UbwError("Usage: ubw delete <work-order> <YYYY-MM-DD>");
+    await withScreen(async (ui) => {
+      let s = await ui.goto(parseIsoDate(dateArg));
+      const row = rowByWorkOrder(s, workOrder);
+      if (!row) throw new UbwError(`No row for ${workOrder} in period ${s.period}.`);
+      if (!s.buttons.delete) throw new UbwError(`Period ${s.period} is ${s.status.label}; rows cannot be removed.`);
+      ui.markId(idOf(row.name) + "__delete", `Mark box of ${workOrder}`);
+      ui.act("check");
+      ui.markId(idOf(s.buttons.delete), "Delete button");
+      s = await ui.click("the row to be removed");
+      if (rowByWorkOrder(s, workOrder)) throw new UbwError(`Row ${workOrder} could not be removed.`, { details: s.messages });
+      s = await ui.save();
+      if (flags.json) out.json({ period: s.period, messages: s.messages, rows: s.toJSON().rows });
+      else printScreen(s, flags);
+      if (s.messages.errors.length || s.messages.result?.type !== "success") throw new UbwError("Save did not confirm success.", { details: s.messages });
     });
   },
 
+  // Marks every row, presses Ready, sets the period status to Ready, saves.
   async submit({ flags, positional }) {
     const date = parseIsoDate(positional[0] || "today");
-    const wanted = flags.draft ? "P" : "N";
-    const rowWanted = flags.draft ? "Draft" : "Ready";
-    await withSession(flags, async (session) => {
-      let screen = await Screen.open(session, date);
-      if (!screen.rows.length) throw new UbwError(`Period ${screen.period} has no rows to submit.`);
-      if (screen.status.code === wanted && screen.rows.every((r) => r.status === rowWanted)) {
-        if (flags.json) out.json(screen.toJSON());
-        else {
-          printScreen(screen, flags);
-          console.log(`Period ${screen.period}: already ${flags.draft ? "Draft" : "sent for approval"}, nothing saved`);
-        }
+    await withScreen(async (ui) => {
+      let s = await ui.goto(date);
+      if (!s.rows.length) throw new UbwError(`Period ${s.period} has no rows to submit.`);
+      if (s.status.code === "N" && s.rows.every((r) => r.status === "Ready")) {
+        printScreen(s, flags);
+        if (!flags.json) console.log(`Period ${s.period}: already sent for approval, nothing saved`);
         return;
       }
-      if (!screen.buttons.ready) throw new UbwError(`Period ${screen.period} is ${screen.status.label}; status cannot change.`);
-      // Two things carry a status: every grid row, and the timesheet header. The
-      // grid buttons move the rows only; a period whose rows are Ready under a
-      // Draft header reports "Parts of the timesheet ... have been sent for
-      // approval" and still waits for the employee. The header field moves the
-      // period as a whole, so the header goes first on the way back to Draft and
-      // last on the way to Ready.
-      const mark = () => Object.fromEntries(screen.rows.map((r) => [r.name + "$_delete", "on"]));
-      if (flags.draft && screen.status.code !== wanted) screen = await screen.setHeaderStatus(wanted);
-      screen = await screen.postback(flags.draft ? screen.buttons.draft : screen.buttons.ready, flags.draft ? "action:SetDraftStatus" : "action:SetSubmitStatus", mark());
-      if (screen.status.code !== wanted) screen = await screen.setHeaderStatus(wanted);
-      screen = await screen.postback(screen.buttons.save);
-      if (flags.json) out.json(screen.toJSON());
-      else printScreen(screen, flags);
-      if (screen.messages.errors.length) throw new UbwError("Save reported errors.", { details: screen.messages });
-      if (screen.status.code !== wanted) throw new UbwError(`Period ${screen.period} still has status ${screen.status.label} (${screen.status.code}).`, { details: screen.messages });
-      // Rows that the approver already holds do not come back on the employee's request.
-      const stuck = screen.rows.filter((r) => r.status !== rowWanted);
-      if (stuck.length)
-        throw new UbwError(
-          `Period ${screen.period} header is ${screen.status.label}, but ${stuck.map((r) => `${r.workOrder} (${r.status})`).join(", ")} did not change to ${rowWanted}.` +
-            (flags.draft ? " Unit4 keeps rows that are already sent for approval; the approver has to reject them." : ""),
-          { details: screen.messages },
-        );
-      if (screen.messages.result?.type !== "success") throw new UbwError("Submit did not confirm success.", { details: screen.messages });
+      if (!s.buttons.ready || !s.names.status) throw new UbwError(`Period ${s.period} is ${s.status.label}; status cannot change.`);
+      for (const r of s.rows) {
+        ui.markId(idOf(r.name) + "__delete", `Mark box of ${r.workOrder}`);
+        ui.act("check");
+      }
+      ui.markId(idOf(s.buttons.ready), "Ready button");
+      s = await ui.click("the rows to turn Ready");
+      // The Status field validates on the client; no postback follows.
+      ui.markId(idOf(s.names.status + "$Editor"), "Status field");
+      ui.typeKeys(flags.label ? String(flags.label) : "Ready");
+      const code = ui.frameJs(`const i = d.getElementById(${JSON.stringify(idOf(s.names.status + "$RowValue"))}); return i && i.value;`);
+      if (code !== "N") throw new UbwError(`The Status field did not take Ready (value ${code}). On a screen in another language, pass the label with --label.`);
+      if (flags["dry-run"]) {
+        const rows = ui.screen().rows;
+        console.log(`Dry run for period ${s.period}: rows ${rows.map((r) => `${r.workOrder} ${r.status}`).join(", ")}, Status field Ready. Not saved; closing the browser discards it.`);
+        return;
+      }
+      s = await ui.save();
+      if (s.messages.errors.length) throw new UbwError("Save reported errors.", { details: s.messages });
+      await ui.openScreen();
+      s = await ui.goto(date);
+      printScreen(s, flags);
+      const stuck = s.rows.filter((r) => r.status !== "Ready");
+      if (s.status.code !== "N" || stuck.length)
+        throw new UbwError(`Period ${s.period} is ${s.status.label} with rows ${s.rows.map((r) => `${r.workOrder} (${r.status})`).join(", ")}; the week is not with the approver.`);
+    });
+  },
+
+  // Compares Sum and Inv.value of every row in the row details.
+  async check({ flags, positional }) {
+    const date = parseIsoDate(positional[0] || "today");
+    await withScreen(async (ui) => {
+      const s = await ui.goto(date);
+      const rows = [];
+      for (const row of s.rows) rows.push({ workOrder: row.workOrder, status: row.status, ...(await ui.invoiceValue(row)) });
+      if (flags.json) out.json({ period: s.period, rows });
+      else if (!rows.length) console.log(`Period ${s.period}: no rows`);
+      else out.table(rows.map((r) => ({ period: s.period, workOrder: r.workOrder, status: r.status, sum: r.sum, invValue: r.inv, ok: r.match ? "yes" : "NO" })));
+      if (rows.some((r) => !r.match)) throw new UbwError(`Period ${s.period}: Inv.value differs from Sum; the project would invoice the wrong hours.`);
     });
   },
 
   help() {
-    console.log(`ubw - Unit4 ERP timesheet CLI
+    console.log(`ubw - Unit4 ERP timesheet CLI (drives the web UI through agent-browser)
 
-  ubw login [--url BASE] [--menu TS1611]   renew silently, else log in through a browser window; --fresh forces the window
-  ubw login --cookie "name=value; ..."      save a pasted Cookie header instead (no silent renewal later)
+  ubw login [--url BASE] [--menu TS1611]   open a browser window for the Unit4 sign-in; --fresh forgets the old session first
   ubw whoami                                session check
   ubw show [DATE]                           timesheet period containing DATE (default today)
   ubw search TEXT                           find work orders by code or description
-  ubw set WO DATE=HOURS [DATE=HOURS ...]    write hours on the row for work order WO (adds the row when missing), saves as draft
+  ubw set WO DATE=HOURS [DATE=HOURS ...]    type hours on the row for work order WO (adds the row when missing), save as draft
   ubw delete WO DATE                        remove the WO row from the period containing DATE
-  ubw submit [DATE] [--draft]               set the rows and the period to Ready and save (sends for approval); --draft takes the period back
-  ubw logout                                forget session and browser profile
+  ubw submit [DATE] [--dry-run] [--label L]  mark the rows Ready, set the period status to Ready, save (sends for approval); --dry-run stops before Save
+  ubw check [DATE]                          compare Sum and Inv.value of every row in the period
+  ubw logout                                forget the stored browser session
 
 DATE is YYYY-MM-DD, today or yesterday. Add --json for machine output.
-Exit codes: 0 ok, 1 error, 2 login needed.
+Exit codes: 0 ok, 1 error, 2 login needed, 3 agent-browser missing.
 
 Environment:
   UBW_HOME     data directory (default ~/.ubw-timesheet)
-  UBW_BROWSER  browser executable when none is found (Chrome, Edge, or Brave)
-  UBW_DEBUG    directory; every page received is written there`);
+  UBW_SESSION  agent-browser session name (default ubw-timesheet)
+  UBW_DEBUG    directory; every screen read is written there`);
   },
 };
 
@@ -1197,4 +1079,4 @@ function isEntryPoint() {
 }
 if (isEntryPoint()) main();
 
-export { Screen, Session, BrowserCdp, browserLogin, findBrowser, parseInputs, tags, elementAt, childElements };
+export { Screen, parseInputs, tags, elementAt, childElements, winQuote };
