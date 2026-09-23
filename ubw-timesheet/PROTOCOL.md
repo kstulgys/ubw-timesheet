@@ -106,8 +106,9 @@ work order. Postbacks used:
 | Add row | `<grid>buttons$_newButton` | `undefined` | |
 | Set work order | `<grid>rowN$1574$Control` | `validate` | `…$1574$Editor` and `…$1574$RowValue` both = code (`RowValue` is what the server reads) |
 | Edit an existing row | `<grid>rowN$_edit` | `undefined` | |
-| Change hours | any; the server reads all posted values | | `…$reg_valueK$i` = `8.00`, `IsDirty` = `true` |
-| Save | `b$tblsysSave` | `undefined` | may carry changed values in the same post |
+| Change hours | `<grid>rowN$reg_valueK` (the cell, without `$i`) | `undefined` | `…$reg_valueK$i` = `8.00`, `IsDirty` = `true`; one postback per changed day, as the cell's `onchange` does |
+| Save | `b$tblsysSave` | `undefined` | |
+| Row details | `<grid>rowN$zoom` | `action:Zoom` | opens the "Time entry" dialog, section `b$s93$…` |
 | Ready / Draft (rows) | button whose onclick has `action:SetSubmitStatus` / `action:SetDraftStatus` | that action string | `<grid>rowN$_delete=on` for each selected row, then Save |
 | Ready / Draft (period) | `<hdr>1551$Control` | `validate` | `…$1551$Editor` and `…$1551$RowDescription` = the label, `…$1551$RowValue` = `N` or `P`, `IsDirty` = `true`, then Save |
 | Delete rows | `<grid>buttons$_deleteButton` | `undefined` | `<grid>rowN$_delete=on`, then Save |
@@ -123,6 +124,20 @@ Responses carry the outcome in three places:
   approval" when the rows are Ready under a Draft header, and "Timesheet for X
   in period 202643 has been sent for approval" when the header is Ready too.
 - The re-rendered grid itself.
+
+## Invoice value
+
+Each row carries an invoice value next to its hours. The grid does not show
+it; the row's Zoom dialog does, as `Sum` (`…$reg_value$i`) and `Inv.value`
+(`…$inv_value$i`). The project reports use `Inv.value` as the invoice base.
+
+The server sets `Inv.value` only in the change event of an hour cell, the
+postback the browser fires when you leave the cell. Hours posted together
+with Save are stored, but `Inv.value` stays at `0.00`, and the project
+reports then show the week as negative invoice hours. Periods 202644 and
+202645 were booked that way in September 2026. So every changed day gets its
+own cell postback before Save, and a check after a booking compares `Sum`
+with `Inv.value` in the Zoom dialog.
 
 ## Two statuses
 

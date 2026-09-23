@@ -9,6 +9,14 @@ where, and the agent books them by sending the same form posts the browser
 sends. You never run a command yourself: the agent opens a browser window
 once for the sign-in and keeps the session alive after that.
 
+> **Warning:** until 23 September 2026 the script saved hours with an
+> invoice value of 0 (`Inv.value` in the row's details). The timesheet looked
+> right, but the project reports showed negative invoice hours. Finance had to
+> correct each week by hand, with help from Unit4 support. The fix has only
+> been checked on Draft weeks. No week booked with it has gone through
+> approval and transfer yet. Ask your finance or project team before you book
+> real hours with this skill.
+
 ## Requirements
 
 - Windows, macOS, or Linux with Node.js 18 or newer on the machine that runs
@@ -73,9 +81,18 @@ talks to Unit4 Identity Services and never causes an MFA prompt.
 
 Tested in September 2026 on Linux with Chrome 152 against Macaw's tenant:
 sign-in, session renewal, reading periods, work-order search, booking hours on
-new and existing rows, removing a row, and the guards on transferred periods.
-Sending a period for approval replays the request sequence recorded from the
-web UI and has not run from the script yet.
+new and existing rows, removing a row, sending a period for approval, and the
+guards on transferred periods.
+
+Known problem: weeks booked before the invoice-value fix have `Inv.value`
+0.00 on every row. The script can't change them once they are Transferred;
+finance has to correct them. Since the fix, `set` sends every changed day the
+way the browser does. After each save it reloads the week and checks that
+`Inv.value` equals the row's hours. That check passes on Draft weeks. No week
+has been through transfer with the fix yet, and other fields in the row
+details (cost category, income category, cost centre) have not been compared
+with rows booked in the web UI. See "Invoice value" in
+[`PROTOCOL.md`](ubw-timesheet/PROTOCOL.md).
 
 A smoke test runs in GitHub Actions on Windows, macOS, and Linux with Node 18
 and 22. It covers what differs per operating system: browser discovery, the

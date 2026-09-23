@@ -1046,20 +1046,34 @@ const commands = {
           row = screen.findRow(workOrder, timecode);
           if (!row || !row.editing) throw new UbwError(`Work order ${workOrder} was not accepted.`, { details: screen.messages });
         }
-        const changes = {};
+        // Type each day the way the browser does: the cell's change event is a
+        // postback of its own, and the server computes the row's invoice value
+        // (Zoom > Inv.value) only there. Hours that ride on Save alone are stored
+        // with Inv.value 0, so the project gets them as negative invoice hours.
         for (const e of wanted) {
-          const col = screen.dayColumn(e.date);
-          const input = row.cells[col.column]?.input;
+          const input = screen.editingRow?.cells[screen.dayColumn(e.date).column]?.input;
           if (!input) throw new UbwError(`No editable cell for ${isoDate(e.date)}.`);
-          changes[input] = formatHours(e.hours, screen.regional.decimalSep);
+          screen = await screen.postback(input.slice(0, -"$i".length), undefined, { [input]: formatHours(e.hours, screen.regional.decimalSep) });
+          if (screen.messages.errors.length) throw new UbwError(`Unit4 rejected ${isoDate(e.date)}=${e.hours}: ${describeMessages(screen.messages).join(" | ")}`, { details: screen.messages });
         }
-        screen = await screen.postback(screen.buttons.save, undefined, changes);
+        screen = await screen.postback(screen.buttons.save);
         const saved = screen.findRow(workOrder, timecode);
         results.push({ period: screen.period, changed: true, row: saved ? rowSummary(saved) : null, messages: screen.messages });
         const mismatch = saved && wanted.find((e) => saved.hours[isoDate(e.date)] !== e.hours);
         if (screen.messages.errors.length || screen.messages.result?.type !== "success" || !saved || mismatch) {
           throw new UbwError(`Save failed for period ${screen.period}: ${describeMessages(screen.messages).join(" | ") || (mismatch ? `${isoDate(mismatch.date)} shows ${saved.hours[isoDate(mismatch.date)]} instead of ${mismatch.hours}` : "no confirmation from server")}`, { details: results });
         }
+        // The invoice value is not in the grid; the row's Zoom dialog shows it.
+        // Right after Save the dialog shows zeros, so read it from a fresh load.
+        const reloaded = await Screen.open(session, inPeriod[0].date);
+        const stored = reloaded.findRow(workOrder, timecode);
+        if (!stored) throw new UbwError(`Row ${workOrder} is missing after reloading period ${reloaded.period}.`, { details: results });
+        const zoom = await reloaded.postback(stored.name + "$zoom", "action:Zoom");
+        const detail = (suffix) => Object.entries(zoom.fields).find(([k]) => !k.startsWith(zoom.names.grid) && k.endsWith(suffix))?.[1];
+        const sum = detail("$reg_value$i"), inv = detail("$inv_value$i");
+        if (sum == null || inv == null) throw new UbwError(`Could not read Inv.value for ${workOrder} in period ${screen.period}; check the row's Zoom dialog in Unit4.`, { details: results });
+        if (parseHours(inv, screen.regional.decimalSep) !== parseHours(sum, screen.regional.decimalSep))
+          throw new UbwError(`Period ${screen.period}: ${workOrder} saved with Sum ${sum} but Inv.value ${inv}; the project would invoice the wrong hours.`, { details: results });
       }
       if (flags.json) out.json(results);
       else for (const r of results) {

@@ -50,8 +50,10 @@ steps 1 and 2 for today and report the period.
    server capped the list, add a second word to narrow it.
 4. **Book the hours.** One `set <work-order> <date>=<hours> ...` per work
    order. The command adds the row when it is missing, saves as Draft, and
-   prints the saved row. Done when every requested day shows the requested
-   hours and the printed total for the period matches what the user expects.
+   prints the saved row. After each save it reloads the week and checks that
+   the row's invoice value (`Inv.value`) equals its hours. Done when every
+   requested day shows the requested hours and the printed total for the
+   period matches what the user expects.
 5. **Submit only on request.** `submit <date>` marks every row of the period
    Ready, sets the period status to Ready, and sends it for approval. Do this
    only when the user asks for it, the period has ended, and the user has
@@ -80,6 +82,11 @@ steps 1 and 2 for today and report the period.
 - "not editable": the row is Closed or Transferred. Report it; do not retry.
 - No browser found: ask the user to install Chrome or Edge, or set
   `UBW_BROWSER` to a Chromium-based browser executable.
+- "saved with Sum ... but Inv.value ...": the hours are saved, but the
+  project would invoice the wrong amount. Stop booking and tell the user
+  which row and period it is. Do not submit the period. The user can correct
+  the row in the Unit4 web UI: retype one day's hours, save, and check that
+  `Inv.value` in the row's details (the Zoom button) equals the row's `Sum`.
 - Parse errors or wrong values: Unit4 changed the screen. `PROTOCOL.md`
   documents the requests and markup the script relies on and how the traffic
   was captured, so you can fix `scripts/ubw.mjs`.
