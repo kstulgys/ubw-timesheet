@@ -150,11 +150,22 @@ class Ui {
     return ui;
   }
 
+  enterFrame() {
+    ab(["frame", FRAME]);
+    this.inFrame = true;
+  }
+
   url() {
     return ab(["get", "url"]).url ?? "";
   }
 
+  // agent-browser 0.45 runs eval in the frame that the last "frame" command
+  // selected, so return to the top document before reading the page.
   js(code) {
+    if (this.inFrame) {
+      ab(["frame", "main"]);
+      this.inFrame = false;
+    }
     return ab(["eval", "-b", Buffer.from(code, "utf8").toString("base64")]).result;
   }
 
@@ -215,7 +226,7 @@ class Ui {
   }
 
   act(...args) {
-    ab(["frame", FRAME]);
+    this.enterFrame();
     ab([args[0], `[${TARGET_ATTR}]`, ...args.slice(1)]);
   }
 
@@ -237,7 +248,7 @@ class Ui {
   // Types into the marked field like a person: focus, select the old value,
   // type, and leave with Tab. Tab fires the field's change event.
   typeKeys(text) {
-    ab(["frame", FRAME]);
+    this.enterFrame();
     ab(["focus", `[${TARGET_ATTR}]`]);
     ab(["press", SELECT_ALL]);
     ab(["keyboard", "type", text]);
@@ -857,7 +868,7 @@ const commands = {
           `const p = d.getElementById(${popup}); if (!p) return null; const rows = [...p.querySelectorAll("tr[role=option]")].map((tr) => [...tr.cells].map((c) => c.textContent.trim())); if (rows.length && p.offsetParent) return { rows }; const notice = p.innerText.trim(); return notice ? { notice } : null;`,
         );
       ui.markId(idOf(input), "Work order field");
-      ab(["frame", FRAME]);
+      ui.enterFrame();
       ab(["focus", `[${TARGET_ATTR}]`]);
       ab(["keyboard", "type", query]);
       let list = null;
